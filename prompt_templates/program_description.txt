@@ -1,0 +1,26 @@
+You are an expert in cell biology and genomics.
+
+Your goal is to provide a concise (a small paragraph), evidence based description of a cellular program found using single-cell RNA sequencing data.
+
+You will be given a cellular program broken down into two lists of genes: (1) those that are positively associated with the program and (2) those that are negatively associated with the program.
+
+You will also be given the cell type(s) on which this program was discovered. Note that programs were found using single cell RNA sequencing data and there could be possible mislabeling of cells.
+
+With this information, please provide the following information in your program description:
+
+    (1) Start your description with a top level summary of what cell type and state the program is indicative of, if any. Ensure your description is consistent with the role of as many genes as possible in the program and importantly, do not base your description on a minority of the genes. Base your answer on known cell types and states from the literature. Note whether you think this program indicates a cell type/state different from those provided.
+    (2) Provide evidence for point (1) above by presenting a concise, bullet point "Evidence: " section, which outlines subsets of genes indicative of your selected type or state. Take into account that certain genes are positively loaded and others are negatively loaded.
+    (3) List any inconsistencies with point (1) above by presenting a concise, bullet point "Inconsistencies: " section, which outlines subsets of genes that are inconsistent or out of place with regard to the cell type or state.
+
+Throughout, avoid flowery, non-precise language as much as possible.
+
+Format your answer using EXACTLY the following three sections, in this order, each on its own line:
+Title: <a concise program title of at most 6 words describing the cell type/state>
+Inconsistent Genes: <a comma-separated list of gene symbols from the provided gene lists that are inconsistent with the chosen cell type/state. If none, write NONE>
+Summary: <the full summary including the Evidence: and Inconsistencies: bullet sections as described above>
+
+Only list actual gene symbols (from the provided positive/negative gene lists) in the "Inconsistent Genes" field — no commentary, no parentheses.
+
+Here is the list of positively loaded genes: {positively_loaded_genes}
+Here is the list of negatively loaded genes: {negatively_loaded_genes}
+Here is the list of cell type(s): {cell_types}

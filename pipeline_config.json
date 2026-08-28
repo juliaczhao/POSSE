@@ -1,0 +1,50 @@
+{
+  "global": {
+    "cell_types": [],
+    "cell_type_label": "cell_type",
+    "raw_data_path": "/mnt/local/allatlasesrun/crc_tnkilc_nofilter_cleaned/all/anndata_files/raw_adata_chunk_1_no_p3_activity_gt1.h5ad",
+    "output_dir": "/mnt/local/allatlasesrun/crc_tnkilc_nofilter_cleaned/no_p3_activity_gt1/",
+    "output_prefix": "filtered_data/",
+    "cooccurrence_threshold": 100
+  },
+  "preprocess": {
+    "filter_raw_data": false,
+    "umi_threshold": 30000,
+    "nonzero_gene_percentage": 1,
+    "mt_ratio_percentage": 99
+  },
+  "outlier_clip": {
+    "top_k_percentage": 1
+  },
+  "compute_ids": {},
+  "statistical_program_finding": {
+    "mse_threshold": 0.01,
+    "p_val": 0.05,
+    "max_significant_neighbors": 1000,
+    "model_dir": "beta_fit_model/",
+    "model_mu_filename": "1M_20_HPO_xrfm_mu.pkl",
+    "model_logkappa_filename": "1M_20_HPO_xrfm_log_kappa.pkl"
+  },
+  "postprocess_adjacency_matrix": {},
+  "program_finding": {
+    "min_clique_size": 5,
+    "growth_threshold": 0.9,
+    "cluster_start_resolution": 1,
+    "min_program_size": 5,
+    "program_path_dir": "clique_based_programs",
+    "program_path_name": "programs_after_grow_merge.json",
+    "containment_merge_threshold": 0.7,
+    "louvain_backend": "cpu"
+  },
+  "program_activity": {
+    "loading_type": "ids_eig",
+    "program_vector_scaling": "curvature_clip"
+  },
+  "report_plots": {
+    "leiden_resolution": 0.5
+  },
+  "llm_program_summaries": {
+    "api_key": "replace with your own API",
+    "provide_celltype": false
+  }
+}
