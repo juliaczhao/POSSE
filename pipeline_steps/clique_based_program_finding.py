@@ -1,4 +1,4 @@
-"""Gene programs from the graph of significant gene-gene edges.
+"""Find clique-based programs in the significant gene-gene graph.
 
 Three stages:
     1. Seed-anchored clique peeling over each gene's adjacency neighbourhood.
@@ -24,11 +24,11 @@ Writes
 import json
 import logging
 import multiprocessing as mp
-from multiprocessing import shared_memory
 import os
 import random
 from collections import defaultdict
 from itertools import combinations
+from multiprocessing import shared_memory
 
 import community as community_louvain
 import hickle as hkl
@@ -41,6 +41,7 @@ from tqdm import tqdm
 try:
     import cudf
     import cugraph
+
     _CUGRAPH_AVAILABLE = True
 except ImportError:
     _CUGRAPH_AVAILABLE = False
@@ -51,11 +52,25 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 
-_GROWTH_DENSITY_FLOOR    = 0.9
-_LOUVAIN_RESOLUTION_S3   = 2.0
-_CLUSTER_LOW_THRESHOLD   = 0.5
-_SPLIT_THRESHOLD         = 0.5
-_MERGE_THRESHOLD         = 0.8
+_GROWTH_DENSITY_FLOOR = 0.9
+_LOUVAIN_RESOLUTION_S3 = 2.0
+_CLUSTER_LOW_THRESHOLD = 0.5
+_SPLIT_THRESHOLD = 0.5
+_MERGE_THRESHOLD = 0.8
+
+_CLIQUE_WORKER_SHM = None
+_CLIQUE_WORKER_ADJ = None
+_CLIQUE_WORKER_GENE_LIST_IDX = None
+_CLIQUE_WORKER_ADJ_GENES = None
+_CLIQUE_WORKER_MIN_SIZE = None
+
+
+def _available_cpu_count():
+    """Return the CPUs available to this process, respecting scheduler affinity."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
 
 
 def _compute_edge_density_matrix(gene_lists, adj, gene_to_idx):
@@ -191,24 +206,42 @@ def _peel_cliques(adj_matrix, gene_list_idx, gene_names, seed_gene, min_clique_s
     return cliques
 
 
+def _initialize_clique_worker(shm_name, adj_shape, gene_list, min_clique_size):
+    """Attach one worker process to the shared adjacency and immutable gene index."""
+    global _CLIQUE_WORKER_SHM
+    global _CLIQUE_WORKER_ADJ
+    global _CLIQUE_WORKER_GENE_LIST_IDX
+    global _CLIQUE_WORKER_ADJ_GENES
+    global _CLIQUE_WORKER_MIN_SIZE
+
+    _CLIQUE_WORKER_SHM = shared_memory.SharedMemory(name=shm_name)
+    _CLIQUE_WORKER_ADJ = np.ndarray(
+        adj_shape,
+        dtype=np.int8,
+        buffer=_CLIQUE_WORKER_SHM.buf,
+    )
+    _CLIQUE_WORKER_GENE_LIST_IDX = {gene: index for index, gene in enumerate(gene_list)}
+    _CLIQUE_WORKER_ADJ_GENES = set(gene_list)
+    _CLIQUE_WORKER_MIN_SIZE = min_clique_size
+
+
 def _process_gene_cliques(args):
     """Worker function for parallel Stage 1 clique peeling."""
-    gene, nbrs, adj_genes_set, gene_list, gene_list_idx, shm_name, adj_shape, min_clique_size = args
-
-    shm = shared_memory.SharedMemory(name=shm_name)
-    adj_matrix = np.ndarray(adj_shape, dtype=np.int8, buffer=shm.buf)
-
-    neighborhood = [g for g in nbrs if g in adj_genes_set]
-    if gene in adj_genes_set and gene not in neighborhood:
+    gene, nbrs = args
+    neighborhood = [g for g in nbrs if g in _CLIQUE_WORKER_ADJ_GENES]
+    if gene in _CLIQUE_WORKER_ADJ_GENES and gene not in neighborhood:
         neighborhood.append(gene)
 
-    if len(neighborhood) < min_clique_size:
-        shm.close()
+    if len(neighborhood) < _CLIQUE_WORKER_MIN_SIZE:
         return gene, {"neighborhood_size": len(neighborhood), "cliques": []}
 
-    cliques = _peel_cliques(adj_matrix, gene_list_idx, neighborhood,
-                            seed_gene=gene, min_clique_size=min_clique_size)
-    shm.close()
+    cliques = _peel_cliques(
+        _CLIQUE_WORKER_ADJ,
+        _CLIQUE_WORKER_GENE_LIST_IDX,
+        neighborhood,
+        seed_gene=gene,
+        min_clique_size=_CLIQUE_WORKER_MIN_SIZE,
+    )
     return gene, {"neighborhood_size": len(neighborhood), "cliques": cliques}
 
 
@@ -219,41 +252,59 @@ def _find_neighborhood_cliques(adj_df, neighbors, min_clique_size):
     """
     adj_matrix = adj_df.values.astype(np.int8)
     gene_list = list(adj_df.index)
-    gene_list_idx = {g: i for i, g in enumerate(gene_list)}
-    adj_genes_set = set(gene_list)
     adj_shape = adj_matrix.shape
-
-    n_workers = min(mp.cpu_count(), 16)
 
     shm = shared_memory.SharedMemory(create=True, size=adj_matrix.nbytes)
     shared_arr = np.ndarray(adj_shape, dtype=np.int8, buffer=shm.buf)
     np.copyto(shared_arr, adj_matrix)
 
-    work_items = [
-        (gene, nbrs, adj_genes_set, gene_list, gene_list_idx, shm.name, adj_shape, min_clique_size)
-        for gene, nbrs in neighbors.items()
-    ]
+    work_items = [(gene, nbrs) for gene, nbrs in neighbors.items()]
+    n_workers = min(_available_cpu_count(), max(1, len(work_items)))
+    chunksize = max(1, len(work_items) // (n_workers * 8))
+    logger.info(
+        "Stage 1 clique workers: %d; task chunksize: %d",
+        n_workers,
+        chunksize,
+    )
 
     collected = {}
-    with mp.Pool(n_workers) as pool:
-        for gene, result in tqdm(
-            pool.imap_unordered(_process_gene_cliques, work_items),
-            total=len(work_items),
-            desc=f"Stage 1: neighborhood cliques ({n_workers} workers)"
-        ):
-            collected[gene] = result
+    try:
+        with mp.Pool(
+            n_workers,
+            initializer=_initialize_clique_worker,
+            initargs=(shm.name, adj_shape, gene_list, min_clique_size),
+        ) as pool:
+            for gene, result in tqdm(
+                pool.imap_unordered(
+                    _process_gene_cliques,
+                    work_items,
+                    chunksize=chunksize,
+                ),
+                total=len(work_items),
+                desc=f"Stage 1: neighborhood cliques ({n_workers} workers)",
+            ):
+                collected[gene] = result
+    finally:
+        shm.close()
+        shm.unlink()
 
-    shm.close()
-    shm.unlink()
-
-    # Preserve original neighbor iteration order for downstream determinism
+    # Preserve neighbor iteration order for downstream determinism.
     results = {gene: collected[gene] for gene in neighbors}
 
     genes_with_cliques = sum(1 for v in results.values() if v["cliques"])
-    total_cliques      = sum(len(v["cliques"]) for v in results.values())
-    skipped = sum(1 for v in results.values() if not v["cliques"] and v["neighborhood_size"] < min_clique_size)
-    logger.info("Stage 1: %d genes, %d skipped (<min_size), %d with cliques, %d total cliques",
-                len(results), skipped, genes_with_cliques, total_cliques)
+    total_cliques = sum(len(v["cliques"]) for v in results.values())
+    skipped = sum(
+        1
+        for v in results.values()
+        if not v["cliques"] and v["neighborhood_size"] < min_clique_size
+    )
+    logger.info(
+        "Stage 1: %d genes, %d skipped (<min_size), %d with cliques, %d total cliques",
+        len(results),
+        skipped,
+        genes_with_cliques,
+        total_cliques,
+    )
     return results
 
 
@@ -288,7 +339,9 @@ def _deduplicate_cliques(clique_results):
                 break
 
     keep = [c for i, c in enumerate(unique) if keep_mask[i]]
-    logger.info("Stage 2 dedup: %d unique → %d after removing subsumed", len(unique), len(keep))
+    logger.info(
+        "Stage 2 dedup: %d unique → %d after removing subsumed", len(unique), len(keep)
+    )
     return keep
 
 
@@ -315,17 +368,19 @@ def _build_cugraph_from_density(density_matrix):
     mask = np.isfinite(upper) & (upper > 0)
     rows, cols = np.where(mask)
     weights = upper[rows, cols]
-    logger.info("Building cugraph: %d nodes, %d edges", density_matrix.shape[0], len(rows))
-    gdf = cudf.DataFrame({
-        'src': rows.astype(np.int32),
-        'dst': cols.astype(np.int32),
-        # float64: cugraph sums edge weights in a nondeterministic parallel
-        # order, and float32 rounding is large enough to tip near-tie modularity
-        # gains. float64 keeps the partition reproducible.
-        'weight': weights.astype(np.float64),
-    })
+    logger.info(
+        "Building cugraph: %d nodes, %d edges", density_matrix.shape[0], len(rows)
+    )
+    gdf = cudf.DataFrame(
+        {
+            "src": rows.astype(np.int32),
+            "dst": cols.astype(np.int32),
+            # Float64 stabilizes parallel edge-weight accumulation.
+            "weight": weights.astype(np.float64),
+        }
+    )
     G = cugraph.Graph()
-    G.from_cudf_edgelist(gdf, source='src', destination='dst', edge_attr='weight')
+    G.from_cudf_edgelist(gdf, source="src", destination="dst", edge_attr="weight")
     return G
 
 
@@ -337,8 +392,7 @@ def _louvain_partition(density_matrix, resolution):
     n = density_matrix.shape[0]
     backend = _LOUVAIN_BACKEND
     if backend == "gpu" and not _CUGRAPH_AVAILABLE:
-        logger.warning("cugraph unavailable; falling back to CPU Louvain")
-        backend = "cpu"
+        raise RuntimeError("GPU Louvain requires cudf and cugraph")
 
     if backend == "cpu":
         G = _build_nx_from_density(density_matrix)
@@ -358,7 +412,7 @@ def _louvain_partition(density_matrix, resolution):
     G = _build_cugraph_from_density(density_matrix)
     parts, modularity = cugraph.louvain(G, resolution=resolution)
     pdf = parts.to_pandas()
-    partition = dict(zip(pdf['vertex'].values, pdf['partition'].values))
+    partition = dict(zip(pdf["vertex"].values, pdf["partition"].values))
     if len(partition) < n:
         next_comm = (int(max(partition.values())) + 1) if partition else 0
         n_singletons = 0
@@ -367,11 +421,18 @@ def _louvain_partition(density_matrix, resolution):
                 partition[v] = next_comm
                 next_comm += 1
                 n_singletons += 1
-        logger.info("GPU Louvain: %d communities (+%d singletons from isolated nodes), modularity=%.4f",
-                    len(set(partition.values())), n_singletons, modularity)
+        logger.info(
+            "GPU Louvain: %d communities (+%d singletons from isolated nodes), modularity=%.4f",
+            len(set(partition.values())),
+            n_singletons,
+            modularity,
+        )
     else:
-        logger.info("GPU Louvain: %d communities, modularity=%.4f",
-                    len(set(partition.values())), modularity)
+        logger.info(
+            "GPU Louvain: %d communities, modularity=%.4f",
+            len(set(partition.values())),
+            modularity,
+        )
     return partition
 
 
@@ -433,7 +494,7 @@ def _compute_clique_periphery(clique_genes, candidate_pool, adj, gene_to_idx):
     """
     if not clique_genes:
         return []
-    half        = 0.5 * len(clique_genes)
+    half = 0.5 * len(clique_genes)
     clique_idxs = [gene_to_idx[g] for g in clique_genes if g in gene_to_idx]
     if not clique_idxs:
         return []
@@ -459,30 +520,30 @@ def _extract_programs(cliques, partition, adj_df, min_clique_size):
     for clique_idx, comm_id in partition.items():
         communities[comm_id].append(clique_idx)
 
-    adj        = adj_df.values
+    adj = adj_df.values
     gene_to_idx = {g: i for i, g in enumerate(adj_df.index)}
-    adj_genes  = set(adj_df.index)
+    adj_genes = set(adj_df.index)
 
     def _density(genes):
         if len(genes) < 2:
-            return float('nan')
+            return float("nan")
         idxs = np.array([gene_to_idx[g] for g in genes])
-        sub  = adj[np.ix_(idxs, idxs)]
+        sub = adj[np.ix_(idxs, idxs)]
         return float(np.triu(sub, k=1).sum() / (len(genes) * (len(genes) - 1) / 2))
 
-    programs = []
-    for comm_id in sorted(communities):
-        gene_union = sorted(set(g for ci in communities[comm_id]
-                                for g in cliques[ci] if g in adj_genes))
+    def extract_community(comm_id):
+        gene_union = sorted(
+            set(g for ci in communities[comm_id] for g in cliques[ci] if g in adj_genes)
+        )
         if len(gene_union) < 2:
-            continue
+            return None
 
-        idxs    = [gene_to_idx[g] for g in gene_union]
+        idxs = [gene_to_idx[g] for g in gene_union]
         sub_adj = adj[np.ix_(idxs, idxs)]
-        upper   = np.triu(sub_adj, k=1)
+        upper = np.triu(sub_adj, k=1)
         rows, cols = np.where(upper == 1)
-        edges   = list(zip(rows.tolist(), cols.tolist()))
-        sub_G   = ig.Graph(n=len(gene_union), edges=edges, directed=False)
+        edges = list(zip(rows.tolist(), cols.tolist()))
+        sub_G = ig.Graph(n=len(gene_union), edges=edges, directed=False)
 
         vid_to_gene = {i: g for i, g in enumerate(gene_union)}
         gene_to_vid = {g: i for i, g in enumerate(gene_union)}
@@ -494,7 +555,9 @@ def _extract_programs(cliques, partition, adj_df, min_clique_size):
         while len(remaining_set) >= min_clique_size:
             remaining_vids = sorted(gene_to_vid[g] for g in remaining_set)
             rem_G = sub_G.subgraph(remaining_vids)
-            rem_vid_to_gene = {i: vid_to_gene[remaining_vids[i]] for i in range(len(remaining_vids))}
+            rem_vid_to_gene = {
+                i: vid_to_gene[remaining_vids[i]] for i in range(len(remaining_vids))
+            }
             clique = _largest_clique_lex_max(rem_G, rem_vid_to_gene)
             if len(clique) < min_clique_size:
                 break
@@ -502,32 +565,46 @@ def _extract_programs(cliques, partition, adj_df, min_clique_size):
             remaining_set -= set(clique)
         remaining = sorted(remaining_set)
 
-        core_periphery = _compute_clique_periphery(core_genes, remaining, adj, gene_to_idx)
+        core_periphery = _compute_clique_periphery(
+            core_genes, remaining, adj, gene_to_idx
+        )
         clique_peripheries = [
             _compute_clique_periphery(pc, remaining, adj, gene_to_idx)
             for pc in peeled_cliques
         ]
         program_periphery = sorted(set(core_periphery).union(*clique_peripheries))
 
-        programs.append({
-            "community_id":         int(comm_id),
-            "core_genes":           core_genes,
-            "core_size":            len(core_genes),
-            "core_density":         _density(core_genes),
-            "core_periphery":       core_periphery,
-            "cliques":              [{"genes": pc, "size": len(pc), "density": _density(pc),
-                                      "periphery": cper}
-                                     for pc, cper in zip(peeled_cliques, clique_peripheries)],
-            "num_cliques":          len(peeled_cliques),
-            "num_clique_genes":     sum(len(pc) for pc in peeled_cliques),
-            "penumbra_genes":       remaining,
-            "penumbra_size":        len(remaining),
-            "periphery_genes":      program_periphery,
-            "periphery_size":       len(program_periphery),
-            "total_size":           len(gene_union),
-            "full_density":         _density(gene_union),
-            "num_input_cliques":    len(communities[comm_id]),
-        })
+        return {
+            "community_id": int(comm_id),
+            "core_genes": core_genes,
+            "core_size": len(core_genes),
+            "core_density": _density(core_genes),
+            "core_periphery": core_periphery,
+            "cliques": [
+                {
+                    "genes": pc,
+                    "size": len(pc),
+                    "density": _density(pc),
+                    "periphery": cper,
+                }
+                for pc, cper in zip(peeled_cliques, clique_peripheries)
+            ],
+            "num_cliques": len(peeled_cliques),
+            "num_clique_genes": sum(len(pc) for pc in peeled_cliques),
+            "penumbra_genes": remaining,
+            "penumbra_size": len(remaining),
+            "periphery_genes": program_periphery,
+            "periphery_size": len(program_periphery),
+            "total_size": len(gene_union),
+            "full_density": _density(gene_union),
+            "num_input_cliques": len(communities[comm_id]),
+        }
+
+    programs = []
+    for community_id in sorted(communities):
+        program = extract_community(community_id)
+        if program is not None:
+            programs.append(program)
 
     programs.sort(key=lambda p: p["total_size"], reverse=True)
     return programs
@@ -540,14 +617,14 @@ def _cluster_and_extract_programs(clique_results, adj_df, resolution, min_clique
         logger.error("Stage 2: No cliques found. Check Stage 1 output.")
         return []
 
-    adj         = adj_df.values
+    adj = adj_df.values
     gene_to_idx = {g: i for i, g in enumerate(adj_df.index)}
 
     logger.info("Stage 2: Computing edge density for %d cliques ...", len(cliques))
     dm = _compute_edge_density_matrix(cliques, adj, gene_to_idx)
 
     logger.info("Stage 2: Running Louvain (resolution=%.2f) ...", resolution)
-    partition    = _louvain_on_density(dm, resolution)
+    partition = _louvain_on_density(dm, resolution)
     n_communities = len(set(partition.values()))
     logger.info("Stage 2: %d communities", n_communities)
 
@@ -561,14 +638,15 @@ def _grow_cliques(cliques, adj_df, growth_threshold, gene_pools=None):
 
     If gene_pools is provided, each clique can only recruit from its
     corresponding gene pool (penumbra of its community).  Otherwise
-    falls back to the full adjacency matrix (original behaviour).
+    uses the full adjacency matrix when no gene pools are supplied.
 
     Returns one grown gene list per input clique, in the same order.
     Peripheries are tracked outside this function (frozen at Stage 2D) and
     follow each grown clique by index.
     """
-    A         = adj_df
-    all_genes = list(A.index)
+    adj = adj_df.values
+    all_genes = list(adj_df.index)
+    gene_to_idx = {gene: index for index, gene in enumerate(all_genes)}
 
     round1 = []
     for i, clique in enumerate(cliques):
@@ -582,20 +660,27 @@ def _grow_cliques(cliques, adj_df, growth_threshold, gene_pools=None):
             round1.append(sorted(clique_set))
             continue
 
-        sub        = A.loc[candidate_genes, clique]
-        connectivity = np.sum(sub.values, axis=1) / len(clique)
+        candidate_idx = [gene_to_idx[gene] for gene in candidate_genes]
+        clique_idx = [gene_to_idx[gene] for gene in clique]
+        sub = adj[np.ix_(candidate_idx, clique_idx)]
+        connectivity = np.sum(sub, axis=1) / len(clique)
 
         eligible = sorted(
-            [(g, c) for g, c in zip(candidate_genes, connectivity) if c > growth_threshold],
-            key=lambda x: -x[1]
+            [
+                (g, c)
+                for g, c in zip(candidate_genes, connectivity)
+                if c > growth_threshold
+            ],
+            key=lambda x: -x[1],
         )
         selected = []
         for gene, _ in eligible:
             test = selected + [gene]
-            n_t  = len(test)
+            n_t = len(test)
             if n_t > 1:
-                sub_A            = A.loc[test, test].values
-                upper            = np.triu_indices(n_t, k=1)
+                test_idx = [gene_to_idx[g] for g in test]
+                sub_A = adj[np.ix_(test_idx, test_idx)]
+                upper = np.triu_indices(n_t, k=1)
                 internal_density = sub_A[upper].sum() / (n_t * (n_t - 1) / 2)
             else:
                 internal_density = 0
@@ -617,17 +702,25 @@ def _grow_cliques(cliques, adj_df, growth_threshold, gene_pools=None):
             round2.append(sorted(expanded))
             continue
 
-        sub      = A.loc[candidate_genes, grown_clique]
-        connectivity = np.sum(sub.values, axis=1) / len(grown_clique)
-        eligible = [g for g, c in zip(candidate_genes, connectivity) if c > growth_threshold]
+        candidate_idx = [gene_to_idx[gene] for gene in candidate_genes]
+        grown_idx = [gene_to_idx[gene] for gene in grown_clique]
+        sub = adj[np.ix_(candidate_idx, grown_idx)]
+        connectivity = np.sum(sub, axis=1) / len(grown_clique)
+        eligible = [
+            g for g, c in zip(candidate_genes, connectivity) if c > growth_threshold
+        ]
         round2.append(sorted(expanded | set(eligible)))
 
-    logger.info("Stage 3 grow: after round 2, program sizes: %s",
-                sorted([len(p) for p in round2], reverse=True)[:10])
+    logger.info(
+        "Stage 3 grow: after round 2, program sizes: %s",
+        sorted([len(p) for p in round2], reverse=True)[:10],
+    )
     return round2
 
 
-def _louvain_cluster_with_pruning(density_matrix, cliques, peripheries, adj_df, resolution):
+def _louvain_cluster_with_pruning(
+    density_matrix, cliques, peripheries, adj_df, resolution
+):
     """Louvain on grown programs + iterative pruning of low-density clusters.
 
     Each cluster's kept programs are unioned (genes + peripheries).
@@ -640,33 +733,37 @@ def _louvain_cluster_with_pruning(density_matrix, cliques, peripheries, adj_df, 
     for idx, cid in partition.items():
         cluster_to_indices[cid].append(idx)
 
-    adj          = adj_df.values
-    gene_to_idx  = {g: i for i, g in enumerate(adj_df.index)}
-    clusters     = []
+    adj = adj_df.values
+    gene_to_idx = {g: i for i, g in enumerate(adj_df.index)}
+    clusters = []
 
     for cid in tqdm(sorted(cluster_to_indices), desc="Stage 3: Louvain pruning"):
-        indices    = cluster_to_indices[cid]
-        keep_idxs  = set(indices)
+        indices = cluster_to_indices[cid]
+        keep_idxs = set(indices)
 
         while len(keep_idxs) > 1:
-            genes = sorted(set(g for idx in keep_idxs
-                               for g in cliques[idx] if g in gene_to_idx))
+            genes = sorted(
+                set(g for idx in keep_idxs for g in cliques[idx] if g in gene_to_idx)
+            )
             if len(genes) < 2:
                 cluster_density = 0.0
             else:
-                g_idxs  = [gene_to_idx[g] for g in genes]
+                g_idxs = [gene_to_idx[g] for g in genes]
                 sub_adj = adj[np.ix_(g_idxs, g_idxs)]
-                ne      = np.triu(sub_adj, k=1).sum()
-                np_     = len(genes) * (len(genes) - 1) / 2
+                ne = np.triu(sub_adj, k=1).sum()
+                np_ = len(genes) * (len(genes) - 1) / 2
                 cluster_density = ne / np_ if np_ > 0 else 0.0
             if cluster_density >= _CLUSTER_LOW_THRESHOLD:
                 break
 
             clique_conn = {}
             for idx in keep_idxs:
-                others    = [j for j in keep_idxs if j != idx]
-                conn_vals = [density_matrix[idx, j] for j in others
-                             if not np.isnan(density_matrix[idx, j])]
+                others = [j for j in keep_idxs if j != idx]
+                conn_vals = [
+                    density_matrix[idx, j]
+                    for j in others
+                    if not np.isnan(density_matrix[idx, j])
+                ]
                 clique_conn[idx] = np.mean(conn_vals) if conn_vals else 0.0
 
             to_remove = min(clique_conn, key=lambda idx: (clique_conn[idx], idx))
@@ -676,8 +773,8 @@ def _louvain_cluster_with_pruning(density_matrix, cliques, peripheries, adj_df, 
             i = next(iter(keep_idxs))
             clusters.append((sorted(cliques[i]), set(peripheries[i])))
         elif len(keep_idxs) > 1:
-            merged_genes  = sorted(set(g for idx in keep_idxs for g in cliques[idx]))
-            merged_peri   = set().union(*(peripheries[idx] for idx in keep_idxs))
+            merged_genes = sorted(set(g for idx in keep_idxs for g in cliques[idx]))
+            merged_peri = set().union(*(peripheries[idx] for idx in keep_idxs))
             clusters.append((merged_genes, merged_peri))
 
         for idx in set(indices) - keep_idxs:
@@ -691,7 +788,8 @@ def _find_maximal_cliques_greedy(genes, adj_df):
     if not genes:
         return []
     genes = list(genes)
-    adj_subset = adj_df.loc[genes, genes].values
+    gene_indices = adj_df.index.get_indexer(genes)
+    adj_subset = adj_df.values[np.ix_(gene_indices, gene_indices)]
     n = len(genes)
 
     upper = np.triu(adj_subset, k=1)
@@ -730,52 +828,64 @@ def _visualize_maximal_cliques_in_programs(programs, adj_df, out_path):
     (largest first, descending), then any remaining program genes are
     appended in sorted order — so every gene in the program is drawn,
     not only those that fell into a peeled clique. Red lines divide
-    programs; tick labels show the program index.
+    programs; one centered tick label identifies each program block.
     """
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
 
     valid = set(adj_df.index)
-    all_genes, program_boundaries, program_labels = [], [], []
+    all_genes, program_boundaries = [], []
+    program_centers, program_tick_labels = [], []
     for pi, prog in enumerate(programs):
+        program_start = len(all_genes)
         prog_in = [g for g in prog if g in valid]
         if prog_in:
             cliques = _find_maximal_cliques_greedy(prog_in, adj_df)
             used = set()
             for clique in cliques:
                 all_genes.extend(clique)
-                program_labels.extend([pi] * len(clique))
                 used.update(clique)
             leftover = sorted(g for g in prog_in if g not in used)
             all_genes.extend(leftover)
-            program_labels.extend([pi] * len(leftover))
-        program_boundaries.append(len(all_genes))
+        program_end = len(all_genes)
+        if program_end > program_start:
+            program_boundaries.append(program_end)
+            program_centers.append((program_start + program_end) / 2)
+            program_tick_labels.append(str(pi))
 
     if not all_genes:
         logger.warning("No genes to plot for maximal-cliques heatmap; skipping.")
         return
 
-    adj_subset = adj_df.loc[all_genes, all_genes].values
-    N = max(1, len(all_genes) // 40)
-    tick_labels = [str(l) if (i % N == 0) else "" for i, l in enumerate(program_labels)]
+    gene_indices = adj_df.index.get_indexer(all_genes)
+    adj_subset = adj_df.values[np.ix_(gene_indices, gene_indices)]
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.figure(figsize=(12, 10))
     ax = plt.gca()
     sns.heatmap(
-        adj_subset, cmap="Blues",
-        xticklabels=tick_labels, yticklabels=tick_labels,
-        ax=ax, cbar=False,
+        adj_subset,
+        cmap="Blues",
+        xticklabels=False,
+        yticklabels=False,
+        ax=ax,
+        cbar=False,
     )
+    ax.set_xticks(program_centers, labels=program_tick_labels, rotation=90)
+    ax.set_yticks(program_centers, labels=program_tick_labels, rotation=0)
+    ax.tick_params(axis="both", which="both", length=0, labelsize=6)
     for boundary in program_boundaries[:-1]:
-        plt.axhline(boundary - 0.5, color="red", linewidth=0.3)
-        plt.axvline(boundary - 0.5, color="red", linewidth=0.3)
-    plt.title(f"Adjacency Matrix Heatmap with Program Boundaries\n"
-              f"{len(programs)} programs, {len(all_genes)} genes")
-    plt.xlabel("Program index (for each gene, by order)")
-    plt.ylabel("Program index (for each gene, by order)")
+        ax.axhline(boundary, color="red", linewidth=0.3)
+        ax.axvline(boundary, color="red", linewidth=0.3)
+    plt.title(
+        f"Adjacency Matrix Heatmap with Program Boundaries\n"
+        f"{len(programs)} programs, {len(all_genes)} genes"
+    )
+    plt.xlabel("Program index")
+    plt.ylabel("Program index")
     plt.tight_layout()
     plt.savefig(out_path, dpi=130)
     plt.close()
@@ -789,60 +899,75 @@ def _split_low_connectivity_cliques(programs, adj_df, threshold):
     AND each split-off sub-clique — inherits the parent program's full
     periphery (duplicated).
     """
-    new_programs = []
-    for genes, peri in programs:
+    adj = adj_df.values
+    gene_to_idx = {gene: index for index, gene in enumerate(adj_df.index)}
+
+    def split_program(program):
+        genes, peri = program
         if len(genes) < 5:
-            new_programs.append((genes, set(peri)))
-            continue
+            return [(genes, set(peri))]
         cliques = _find_maximal_cliques_greedy(genes, adj_df)
         if len(cliques) <= 1:
-            new_programs.append((genes, set(peri)))
-            continue
+            return [(genes, set(peri))]
         keep, splits = [], []
         for clique in cliques:
             rest = [g for g in genes if g not in clique]
             if not rest:
                 keep.append(clique)
                 continue
-            sub  = adj_df.loc[clique, rest].values
+            clique_idx = [gene_to_idx[gene] for gene in clique]
+            rest_idx = [gene_to_idx[gene] for gene in rest]
+            sub = adj[np.ix_(clique_idx, rest_idx)]
             conn = sub.sum() / (len(clique) * len(rest))
             if conn < threshold and len(clique) > 5:
                 splits.append(clique)
             else:
                 keep.append(clique)
+        pieces = []
         if keep:
-            new_programs.append((sorted(set(g for c in keep for g in c)), set(peri)))
+            pieces.append((sorted(set(g for c in keep for g in c)), set(peri)))
         for c in splits:
-            new_programs.append((sorted(c), set(peri)))
+            pieces.append((sorted(c), set(peri)))
+        return pieces
+
+    new_programs = []
+    for program in programs:
+        new_programs.extend(split_program(program))
     logger.info("Stage 3 split: %d → %d programs", len(programs), len(new_programs))
     return new_programs
 
 
 def _merge_high_connectivity(programs, adj_df, threshold):
     """Greedy edge-density merge. Genes and peripheries unioned on merge."""
+    adj = adj_df.values
+    gene_to_idx = {gene: index for index, gene in enumerate(adj_df.index)}
     working = {i: (list(g), set(p)) for i, (g, p) in enumerate(programs)}
     while True:
         items = list(working.items())
-        n     = len(items)
+        n = len(items)
         if n <= 1:
             break
         best_conn, best_pair = threshold, None
         for i in range(n):
             gi = items[i][1][0]
+            gi_idx = [gene_to_idx[gene] for gene in gi]
             for j in range(i + 1, n):
-                gj   = items[j][1][0]
-                sub  = adj_df.loc[gi, gj].values
+                gj = items[j][1][0]
+                gj_idx = [gene_to_idx[gene] for gene in gj]
+                sub = adj[np.ix_(gi_idx, gj_idx)]
                 conn = sub.sum() / (len(gi) * len(gj)) if gi and gj else 0.0
                 if conn > best_conn:
                     best_conn, best_pair = conn, (i, j)
         if best_pair is None:
             break
-        ki, kj   = items[best_pair[0]][0], items[best_pair[1]][0]
-        gi, pi   = working[ki]
-        gj, pj   = working[kj]
+        ki, kj = items[best_pair[0]][0], items[best_pair[1]][0]
+        gi, pi = working[ki]
+        gj, pj = working[kj]
         merged_g = sorted(set(gi + gj))
         merged_p = pi | pj
-        logger.info("  Edge-density merge: %d + %d → %d", len(gi), len(gj), len(merged_g))
+        logger.info(
+            "  Edge-density merge: %d + %d → %d", len(gi), len(gj), len(merged_g)
+        )
         del working[ki], working[kj]
         working[max(working, default=0) + 1] = (merged_g, merged_p)
     return list(working.values())
@@ -856,10 +981,10 @@ def _merge_overlapping(programs, threshold):
         keys = list(working.keys())
         for i in range(len(keys)):
             for j in range(i + 1, len(keys)):
-                ki, kj   = keys[i], keys[j]
-                gi, _    = working[ki]
-                gj, _    = working[kj]
-                inter    = len(gi & gj)
+                ki, kj = keys[i], keys[j]
+                gi, _ = working[ki]
+                gj, _ = working[kj]
+                inter = len(gi & gj)
                 min_size = min(len(gi), len(gj))
                 if min_size == 0:
                     continue
@@ -868,24 +993,31 @@ def _merge_overlapping(programs, threshold):
                     best_overlap, best_pair = overlap, (ki, kj)
         if best_pair is None:
             break
-        ki, kj  = best_pair
-        gi, pi  = working[ki]
-        gj, pj  = working[kj]
+        ki, kj = best_pair
+        gi, pi = working[ki]
+        gj, pj = working[kj]
         merged_g = gi | gj
         merged_p = pi | pj
-        logger.info("  Containment merge: %d + %d → %d (overlap %.3f)",
-                    len(gi), len(gj), len(merged_g), best_overlap)
+        logger.info(
+            "  Containment merge: %d + %d → %d (overlap %.3f)",
+            len(gi),
+            len(gj),
+            len(merged_g),
+            best_overlap,
+        )
         working[ki] = (merged_g, merged_p)
         del working[kj]
-    logger.info("Stage 3 containment merge: %d → %d programs", len(programs), len(working))
+    logger.info(
+        "Stage 3 containment merge: %d → %d programs", len(programs), len(working)
+    )
     return [(sorted(g), p) for (g, p) in working.values()]
 
 
 def _compute_evaluation_metrics(programs, adj, gene_to_idx, total_genes):
-    gene_slots   = sum(len(p) for p in programs)
+    gene_slots = sum(len(p) for p in programs)
     unique_genes = set(g for p in programs for g in p)
-    n_unique     = len(unique_genes)
-    overlap_ratio = gene_slots / n_unique if n_unique > 0 else float('inf')
+    n_unique = len(unique_genes)
+    overlap_ratio = gene_slots / n_unique if n_unique > 0 else float("inf")
 
     max_jaccard, max_pair = 0.0, (-1, -1)
     sets = [set(p) for p in programs]
@@ -907,26 +1039,28 @@ def _compute_evaluation_metrics(programs, adj, gene_to_idx, total_genes):
     median_density = float(np.median(densities)) if densities else 0.0
 
     return {
-        "program_count":           len(programs),
-        "gene_slots":              gene_slots,
-        "unique_genes":            n_unique,
-        "overlap_ratio":           round(overlap_ratio, 3),
-        "max_pairwise_jaccard":    round(max_jaccard, 4),
-        "max_jaccard_pair":        list(max_pair),
+        "program_count": len(programs),
+        "gene_slots": gene_slots,
+        "unique_genes": n_unique,
+        "overlap_ratio": round(overlap_ratio, 3),
+        "max_pairwise_jaccard": round(max_jaccard, 4),
+        "max_jaccard_pair": list(max_pair),
         "median_internal_density": round(median_density, 4),
-        "gene_coverage":           round(n_unique / total_genes, 4) if total_genes > 0 else 0.0,
-        "program_sizes":           sorted([len(p) for p in programs], reverse=True),
+        "gene_coverage": round(n_unique / total_genes, 4) if total_genes > 0 else 0.0,
+        "program_sizes": sorted([len(p) for p in programs], reverse=True),
     }
 
 
-def _grow_and_merge(stage2_programs, adj_df, growth_threshold, containment_merge_threshold):
+def _grow_and_merge(
+    stage2_programs, adj_df, growth_threshold, containment_merge_threshold
+):
     """Stage 3: Grow → Louvain → Split → Merge (edge-density) → Merge (containment)."""
-    adj         = adj_df.values
+    adj = adj_df.values
     gene_to_idx = {g: i for i, g in enumerate(adj_df.index)}
 
-    input_cliques     = []
+    input_cliques = []
     input_peripheries = []
-    clique_penumbras  = []
+    clique_penumbras = []
     for p in stage2_programs:
         penumbra = p.get("penumbra_genes", [])
         input_cliques.append(p["core_genes"])
@@ -938,43 +1072,63 @@ def _grow_and_merge(stage2_programs, adj_df, growth_threshold, containment_merge
             clique_penumbras.append(penumbra)
     logger.info("Stage 3: %d input cliques from Stage 2", len(input_cliques))
 
-    logger.info("Step 1: Grow cliques (growth_threshold=%.3f, community-constrained)", growth_threshold)
-    grown_genes = _grow_cliques(input_cliques, adj_df, growth_threshold,
-                                gene_pools=clique_penumbras)
+    logger.info(
+        "Step 1: Grow cliques (growth_threshold=%.3f, community-constrained)",
+        growth_threshold,
+    )
+    grown_genes = _grow_cliques(
+        input_cliques, adj_df, growth_threshold, gene_pools=clique_penumbras
+    )
     grown_pairs = sorted(
-        zip(grown_genes, input_peripheries),
-        key=lambda gp: (-len(gp[0]), sorted(gp[0]))
+        zip(grown_genes, input_peripheries), key=lambda gp: (-len(gp[0]), sorted(gp[0]))
     )
     grown_only_genes = [g for g, _ in grown_pairs]
-    grown_peris      = [p for _, p in grown_pairs]
+    grown_peris = [p for _, p in grown_pairs]
 
-    logger.info("Step 2: Louvain clustering (resolution=%.1f) + pruning", _LOUVAIN_RESOLUTION_S3)
-    dm        = _compute_edge_density_matrix(grown_only_genes, adj, gene_to_idx)
+    logger.info(
+        "Step 2: Louvain clustering (resolution=%.1f) + pruning", _LOUVAIN_RESOLUTION_S3
+    )
+    dm = _compute_edge_density_matrix(grown_only_genes, adj, gene_to_idx)
     clustered = sorted(
-        _louvain_cluster_with_pruning(dm, grown_only_genes, grown_peris,
-                                       adj_df, _LOUVAIN_RESOLUTION_S3),
-        key=lambda gp: (-len(gp[0]), sorted(gp[0]))
+        _louvain_cluster_with_pruning(
+            dm, grown_only_genes, grown_peris, adj_df, _LOUVAIN_RESOLUTION_S3
+        ),
+        key=lambda gp: (-len(gp[0]), sorted(gp[0])),
     )
     logger.info("After Louvain: %d programs", len(clustered))
 
-    logger.info("Step 3: Split low-connectivity cliques (threshold=%.2f)", _SPLIT_THRESHOLD)
+    logger.info(
+        "Step 3: Split low-connectivity cliques (threshold=%.2f)", _SPLIT_THRESHOLD
+    )
     split = sorted(
         _split_low_connectivity_cliques(clustered, adj_df, _SPLIT_THRESHOLD),
-        key=lambda gp: (-len(gp[0]), sorted(gp[0]))
+        key=lambda gp: (-len(gp[0]), sorted(gp[0])),
     )
 
     logger.info("Step 4: Merge high-connectivity (threshold=%.2f)", _MERGE_THRESHOLD)
-    merged = sorted(_merge_high_connectivity(split, adj_df, _MERGE_THRESHOLD),
-                    key=lambda gp: (-len(gp[0]), sorted(gp[0])))
+    merged = sorted(
+        _merge_high_connectivity(split, adj_df, _MERGE_THRESHOLD),
+        key=lambda gp: (-len(gp[0]), sorted(gp[0])),
+    )
 
-    logger.info("Step 4b: Containment merge (threshold=%.2f)", containment_merge_threshold)
-    final = sorted(_merge_overlapping(merged, containment_merge_threshold),
-                   key=lambda gp: (-len(gp[0]), sorted(gp[0])))
+    logger.info(
+        "Step 4b: Containment merge (threshold=%.2f)", containment_merge_threshold
+    )
+    final = sorted(
+        _merge_overlapping(merged, containment_merge_threshold),
+        key=lambda gp: (-len(gp[0]), sorted(gp[0])),
+    )
 
     final_genes = [g for g, _ in final]
-    metrics = _compute_evaluation_metrics(final_genes, adj, gene_to_idx, len(adj_df.index))
-    logger.info("Stage 3 complete: %d programs, overlap_ratio=%.3f, median_density=%.4f",
-                len(final), metrics["overlap_ratio"], metrics["median_internal_density"])
+    metrics = _compute_evaluation_metrics(
+        final_genes, adj, gene_to_idx, len(adj_df.index)
+    )
+    logger.info(
+        "Stage 3 complete: %d programs, overlap_ratio=%.3f, median_density=%.4f",
+        len(final),
+        metrics["overlap_ratio"],
+        metrics["median_internal_density"],
+    )
     return final, metrics
 
 
@@ -987,7 +1141,7 @@ def run_program_finder(
     PROGRAM_PATH_DIR="clique_based_programs",
     PROGRAM_PATH_NAME="programs_after_grow_merge.json",
     CONTAINMENT_MERGE_THRESHOLD=0.7,
-    LOUVAIN_BACKEND="cpu",
+    LOUVAIN_BACKEND="gpu",
     beta_fits_path=None,
 ):
     """
@@ -1003,43 +1157,55 @@ def run_program_finder(
       LOUVAIN_BACKEND              — "gpu" (cugraph) or "cpu" (python-louvain).
     """
     global _LOUVAIN_BACKEND
-    backend = (LOUVAIN_BACKEND or "cpu").lower()
+    backend = (LOUVAIN_BACKEND or "gpu").lower()
     if backend not in ("cpu", "gpu"):
-        raise ValueError(f"LOUVAIN_BACKEND must be 'cpu' or 'gpu', got: {LOUVAIN_BACKEND!r}")
+        raise ValueError(
+            f"LOUVAIN_BACKEND must be 'cpu' or 'gpu', got: {LOUVAIN_BACKEND!r}"
+        )
     _LOUVAIN_BACKEND = backend
     logger.info("Louvain backend: %s (options: cpu, gpu)", backend)
-    adj_path = os.path.join(working_dir, 'adjacency_matrices', 'significant_symmetric_matrix.hkl')
-    out_dir  = os.path.join(working_dir, PROGRAM_PATH_DIR) if PROGRAM_PATH_DIR else working_dir
+    adj_path = os.path.join(
+        working_dir, "adjacency_matrices", "significant_symmetric_matrix.hkl"
+    )
+    out_dir = (
+        os.path.join(working_dir, PROGRAM_PATH_DIR) if PROGRAM_PATH_DIR else working_dir
+    )
     os.makedirs(out_dir, exist_ok=True)
 
     if beta_fits_path is None:
-        beta_fits_path = os.path.join(working_dir, 'supp_material', 'beta_fit_all_results.json')
+        beta_fits_path = os.path.join(
+            working_dir, "supp_material", "beta_fit_all_results.json"
+        )
 
     logger.info("Loading adjacency matrix from %s", adj_path)
     try:
         adj_df = hkl.load(adj_path)
     except (ValueError, NotImplementedError):
         import pandas as pd
+
         adj_dir = os.path.dirname(adj_path)
-        vals = np.load(os.path.join(adj_dir, 'sym_adj_values.npy'))
-        genes = np.loadtxt(os.path.join(adj_dir, 'sym_adj_genes.txt'), dtype=str)
+        vals = np.load(os.path.join(adj_dir, "sym_adj_values.npy"))
+        genes = np.loadtxt(os.path.join(adj_dir, "sym_adj_genes.txt"), dtype=str)
         adj_df = pd.DataFrame(vals, index=genes, columns=genes)
         logger.info("Loaded from numpy fallback")
     logger.info("Adjacency matrix shape: %s", adj_df.shape)
 
     logger.info("STAGE 1: Building neighbors + finding neighborhood cliques")
     logger.info("Loading neighbors from beta fits: %s", beta_fits_path)
-    neighbors     = _build_neighbors_from_beta_fits(beta_fits_path)
+    neighbors = _build_neighbors_from_beta_fits(beta_fits_path)
     clique_results = _find_neighborhood_cliques(adj_df, neighbors, MIN_CLIQUE_SIZE)
-    cliques_path  = os.path.join(out_dir, "neighborhood_cliques.json")
+    cliques_path = os.path.join(out_dir, "neighborhood_cliques.json")
     with open(cliques_path, "w") as f:
         json.dump(clique_results, f)
     logger.info("Stage 1 saved: %s", cliques_path)
 
-    logger.info("STAGE 2: Cluster cliques → extract programs (resolution=%.2f)",
-                CLUSTER_START_RESOLUTION)
+    logger.info(
+        "STAGE 2: Cluster cliques → extract programs (resolution=%.2f)",
+        CLUSTER_START_RESOLUTION,
+    )
     stage2_programs = _cluster_and_extract_programs(
-        clique_results, adj_df,
+        clique_results,
+        adj_df,
         resolution=CLUSTER_START_RESOLUTION,
         min_clique_size=MIN_CLIQUE_SIZE,
     )
@@ -1053,7 +1219,8 @@ def run_program_finder(
 
     logger.info("STAGE 3: Grow → cluster → split → merge")
     final_programs, _ = _grow_and_merge(
-        stage2_programs, adj_df,
+        stage2_programs,
+        adj_df,
         growth_threshold=GROWTH_THRESHOLD,
         containment_merge_threshold=CONTAINMENT_MERGE_THRESHOLD,
     )
@@ -1061,27 +1228,37 @@ def run_program_finder(
     pre_filter_count = len(final_programs)
     final_programs = [(g, p) for (g, p) in final_programs if len(g) >= MIN_PROGRAM_SIZE]
     if pre_filter_count != len(final_programs):
-        logger.info("Min program size filter: %d → %d programs (removed %d with < %d genes)",
-                    pre_filter_count, len(final_programs),
-                    pre_filter_count - len(final_programs), MIN_PROGRAM_SIZE)
+        logger.info(
+            "Min program size filter: %d → %d programs (removed %d with < %d genes)",
+            pre_filter_count,
+            len(final_programs),
+            pre_filter_count - len(final_programs),
+            MIN_PROGRAM_SIZE,
+        )
 
     adj = adj_df.values
     gene_to_idx = {g: i for i, g in enumerate(adj_df.index)}
     final_genes = [g for g, _ in final_programs]
-    metrics = _compute_evaluation_metrics(final_genes, adj, gene_to_idx, len(adj_df.index))
+    metrics = _compute_evaluation_metrics(
+        final_genes, adj, gene_to_idx, len(adj_df.index)
+    )
 
     output = {}
     for i, (prog, peri) in enumerate(final_programs):
         prog_sorted = sorted(prog)
-        peri_out    = sorted(set(peri) - set(prog_sorted))
+        peri_out = sorted(set(peri) - set(prog_sorted))
         output[str(i)] = {"program": prog_sorted, "periphery": peri_out}
     final_path = os.path.join(out_dir, PROGRAM_PATH_NAME)
     with open(final_path, "w") as f:
         json.dump(output, f, indent=2)
-    logger.info("Final programs saved: %s (%d programs)", final_path, len(final_programs))
+    logger.info(
+        "Final programs saved: %s (%d programs)", final_path, len(final_programs)
+    )
 
     plot_path = os.path.join(
-        working_dir, "supp_material", "program_finding_plots",
+        working_dir,
+        "supp_material",
+        "program_finding_plots",
         "maximal_cliques_in_programs_final.png",
     )
     try:
@@ -1093,15 +1270,15 @@ def run_program_finder(
 
     metrics_out = {
         "parameters": {
-            "min_clique_size":              MIN_CLIQUE_SIZE,
-            "stage2_resolution":            CLUSTER_START_RESOLUTION,
-            "growth_threshold":             GROWTH_THRESHOLD,
-            "containment_merge_threshold":  CONTAINMENT_MERGE_THRESHOLD,
-            "growth_density_floor":         _GROWTH_DENSITY_FLOOR,
-            "louvain_resolution_stage3":    _LOUVAIN_RESOLUTION_S3,
-            "cluster_low_threshold":        _CLUSTER_LOW_THRESHOLD,
-            "split_threshold":              _SPLIT_THRESHOLD,
-            "merge_threshold":              _MERGE_THRESHOLD,
+            "min_clique_size": MIN_CLIQUE_SIZE,
+            "stage2_resolution": CLUSTER_START_RESOLUTION,
+            "growth_threshold": GROWTH_THRESHOLD,
+            "containment_merge_threshold": CONTAINMENT_MERGE_THRESHOLD,
+            "growth_density_floor": _GROWTH_DENSITY_FLOOR,
+            "louvain_resolution_stage3": _LOUVAIN_RESOLUTION_S3,
+            "cluster_low_threshold": _CLUSTER_LOW_THRESHOLD,
+            "split_threshold": _SPLIT_THRESHOLD,
+            "merge_threshold": _MERGE_THRESHOLD,
         },
         "metrics": metrics,
     }
@@ -1111,7 +1288,11 @@ def run_program_finder(
 
     logger.info(f"Program finding complete: {len(final_programs)} programs")
     logger.info(f"  Overlap ratio:      {metrics['overlap_ratio']:.3f}  (target < 1.5)")
-    logger.info(f"  Max Jaccard:        {metrics['max_pairwise_jaccard']:.4f} (target < 0.5)")
-    logger.info(f"  Median density:     {metrics['median_internal_density']:.4f} (target > 0.6)")
+    logger.info(
+        f"  Max Jaccard:        {metrics['max_pairwise_jaccard']:.4f} (target < 0.5)"
+    )
+    logger.info(
+        f"  Median density:     {metrics['median_internal_density']:.4f} (target > 0.6)"
+    )
     logger.info(f"  Gene coverage:      {metrics['gene_coverage']:.4f}")
     logger.info(f"  Program sizes:      {metrics['program_sizes']}")

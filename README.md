@@ -13,17 +13,13 @@ activity score and an LLM coherence annotation.
 
 Citation and paper link coming soon.
 
-This is a minimal research codebase. A pip-installable version is coming soon.
-
 ## Installation
 
 ### Install the environment
 
 Installation uses [uv](https://docs.astral.sh/uv/getting-started/installation/); install it first.
-The POSSE installer uses uv to fetch Python 3.11 when necessary, create an isolated environment,
-install the exact tested dependencies, and verify the pipeline imports.
 
-Clone the repository and install the pinned environment:
+Clone the repository and run the hash-pinned installer:
 
 ```bash
 git clone https://github.com/juliaczhao/POSSE.git
@@ -32,19 +28,14 @@ cd POSSE
 source ~/posse/bin/activate
 ```
 
-That is the complete environment setup. By default, `posse_installer.sh` creates `~/posse` and
-installs the dependencies from `posse_requirements.txt`. To use another location, pass it as the
-only argument:
+By default, the installer creates `~/posse`. To use another location, pass it as the only
+argument:
 
 ```bash
 ./posse_installer.sh /path/to/posse
 ```
 
-The requirements file is fully pinned and hash-checked for Python 3.11 on Linux with NVIDIA
-CUDA 12.8-compatible drivers. Users should normally run the installer instead of installing that
-file manually because the installer supplies the required package-index and verification options.
-It contains only the tested dependencies needed for the complete POSSE pipeline, including report
-generation. Development tools and optional integrations are not installed.
+Use the installer to create the Python 3.11 environment from the pinned POSSE dependencies.
 
 ### Download model files
 
@@ -55,31 +46,27 @@ and place both files in `beta_fit_model/` in this repository:
 - `1M_20_HPO_xrfm_mu.pkl`
 - `1M_20_HPO_xrfm_log_kappa.pkl`
 
-See [`beta_fit_model/instructions.md`](beta_fit_model/instructions.md) for checksums to verify the
-downloads and a description of each file.
+See [`beta_fit_model/instructions.md`](beta_fit_model/instructions.md) for file checksums.
 
 ### Hardware requirements
 
-POSSE runs on Linux with an NVIDIA GPU. The pinned dependencies are CUDA 12 builds, so a
-compatible NVIDIA driver is required; a separate system CUDA toolkit is not. The pipeline needs a
-GPU with **80 GB** of memory.
-Optional RAPIDS packages are not required. If they are absent, POSSE uses Scanpy for report
-clustering and UMAP generation.
+POSSE runs on Linux with one or more 80 GB NVIDIA GPUs and has been tested on A100, H100 and H200
+hardware. It assigns fixed xRFM batches to the visible GPUs.
 
 ## Usage
 
 ### Input data
 
-The pipeline expects a single `.h5ad` file containing **raw counts**, restricted to protein-coding
-genes. No quality-control filtering is required beforehand; the pipeline performs its own.
+The input may be one `.h5ad` file or a directory of `.h5ad` files. Files must contain raw counts
+restricted to protein-coding genes. The built-in cell filter is enabled by default.
 
-If cell types are already annotated, place them in `.obs['cell_type']`. Otherwise a placeholder is
-inserted and the pipeline runs on all cells together.
+To select annotated populations, set `global.cell_type_label` to the relevant `.obs` column and
+list the desired labels in `global.cell_types`. An empty list runs all cells.
 
 ### Configuration
 
-All settings live in `pipeline_config.json`, provided in the repository. The fields you need to set
-for your own data are:
+POSSE does not require hyperparameter tuning. The configuration file is for input data, plotting,
+and LLM annotation preferences. The fields you need to set for your own data are:
 
 | Parameter | Block | Description |
 | :-- | :-- | :--------------------------------------------------------------------------- |
@@ -87,9 +74,12 @@ for your own data are:
 | `output_dir` | `global` | Directory where every output of the pipeline is written. |
 | `cell_type_label` | `global` | The `.obs` column holding the cell-type labels (default `cell_type`). |
 | `cell_types` | `global` | List of cell types to run on; `[]` runs on all cells. |
-| `filter_raw_data` | `preprocess` | Run the built-in QC filter (UMI, gene, and mitochondrial cutoffs). Recommended for large or high-mitochondrial datasets. |
-| `louvain_backend` | `program_finding` | Community-detection backend: `cpu` (fully reproducible) or `gpu` (faster, reproducible only to floating point). |
-| `provide_celltype` | `llm_program_summaries` | Pass the dataset's cell types to the language model during annotation. On grounds interpretations in the data's cell types; off keeps them gene-only. |
+| `cell_type_column` | `report_plots` | Optional finest author-provided `.obs` annotation for report heatmaps and cell-type figures; defaults to `global.cell_type_label`. |
+| `filter_raw_data` | `preprocess` | Apply the UMI, expressed-gene and mitochondrial filters. Defaults to `true` and usually removes a few percent of cells (approximately 2–5% in the tested CRC and HLCA datasets). |
+| `model_dir` | `statistical_program_finding` | Directory containing the two xRFM model files. |
+| `api_key` | `llm_program_summaries` | OpenAI API key for optional program annotation. Leave empty to skip annotation. |
+| `model` | `llm_program_summaries` | OpenAI model used for optional program names and descriptions (default `gpt-5.6-sol`). |
+| `reasoning_effort` | `llm_program_summaries` | Reasoning effort for optional annotation (default `high`). |
 
 All other parameters are the empirical-sweep defaults used for the published results. They are best
 left fixed, though you are welcome to change them.
@@ -114,22 +104,10 @@ python run_pipeline_manual.py my_dataset_config.json
 
 ### LLM annotation
 
-Step 9 names and describes each program with a language model. It runs only when a real API key
-is set in `pipeline_config.json` under `llm_program_summaries.api_key` (OpenAI by default; any
-provider can be substituted).
-
-Provider clients are intentionally excluded from the minimal POSSE environment. To use the
-default OpenAI integration, activate the environment and install its client:
-
-```bash
-uv pip install openai==2.24.0
-```
-
-Without a key, the pipeline still completes: Step 9 writes a summaries file containing the gene
-lists only, and Step 10 produces the report with those gene lists and the plots but no titles or
-descriptions. To add annotations afterwards, fill the `Title` and `Summary` columns of
-`llm_summaries/program_summaries_with_genes.csv` — by hand, or by pasting a program's genes into
-any LLM interface (the prompts are in `prompt_templates/`) — and re-run Step 10.
+Step 9 optionally names and describes each program. Set `llm_program_summaries.api_key` in the run
+configuration and keep that file private. The configured cell labels are included in the request.
+With no API key, the pipeline skips annotation and still writes the complete HTML report to
+`reports/program_analysis_report.html`.
 
 ## License
 

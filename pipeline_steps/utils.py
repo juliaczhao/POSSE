@@ -1,10 +1,11 @@
 """Helpers shared across pipeline steps."""
 
 import json
-import torch
-import numpy as np
-import anndata 
 from copy import deepcopy
+
+import anndata
+import numpy as np
+import torch
 from tqdm import tqdm
 
 
@@ -27,11 +28,11 @@ def point_of_max_curvature(x, y, normalize=True, trim=0.1):
     else:
         xr, yr = x, y
 
-    yx  = np.gradient(yr, xr, edge_order=2)
+    yx = np.gradient(yr, xr, edge_order=2)
     yxx = np.gradient(yx, xr, edge_order=2)
 
     # Curvature for graphs y=f(x): kappa = |y''| / (1 + (y')^2)^(3/2)
-    denom = (1.0 + yx*yx)**1.5
+    denom = (1.0 + yx * yx) ** 1.5
     kappa = np.abs(yxx) / np.where(denom == 0, np.nan, denom)
 
     n = x.size
@@ -53,8 +54,14 @@ def mean_subroutine(X, n_chunk_size=10000):
         sums = sums + torch.sum(X[start:end, :], dim=0)
     return sums
 
-def compute_running_mean(files, gene_set = None, cells = None, n_chunk_size = 5000):
 
+def compute_running_mean(
+    files,
+    gene_set=None,
+    cells=None,
+    n_chunk_size=5000,
+    return_nonzero_counts=False,
+):
     """Running per-gene mean across files, normalised by each cell's total counts."""
     if gene_set is None:
         fname = files[0]
@@ -62,7 +69,8 @@ def compute_running_mean(files, gene_set = None, cells = None, n_chunk_size = 50
         gene_set = adata.var_names.tolist()
 
     means = None
-    total = 0 
+    nonzero_counts = None
+    total = 0
 
     with torch.no_grad():
         for idx, fname in enumerate(tqdm(files)):
@@ -74,31 +82,41 @@ def compute_running_mean(files, gene_set = None, cells = None, n_chunk_size = 50
                 if len(cells_to_use) == 0:
                     continue
                 adata = adata[cells_to_use]
-            
+
             X = adata.X.toarray()
             X = torch.from_numpy(X).cuda().float()
             X /= torch.sum(X, axis=-1, keepdims=True)
             X = torch.nan_to_num(X, nan=0, posinf=0, neginf=0)
 
             n, d = X.shape
-            
-            if means is None: 
+
+            if means is None:
                 means = torch.zeros(d).float().cuda()
+                if return_nonzero_counts:
+                    nonzero_counts = torch.zeros(d, dtype=torch.int64, device=X.device)
+            if return_nonzero_counts:
+                nonzero_counts += torch.count_nonzero(X, dim=0)
             total += n
-            means += n / total * (mean_subroutine(X, n_chunk_size=n_chunk_size) * 1/n - means)
+            means += (
+                n
+                / total
+                * (mean_subroutine(X, n_chunk_size=n_chunk_size) * 1 / n - means)
+            )
             del X
             torch.cuda.empty_cache()
- 
-    means = torch.nan_to_num(means, nan=0., posinf=0, neginf=0)
+
+    means = torch.nan_to_num(means, nan=0.0, posinf=0, neginf=0)
     torch.cuda.empty_cache()
 
-    return means        
-       
+    if return_nonzero_counts:
+        return means, nonzero_counts
+    return means
 
-def compute_running_stddev(files, means, gene_set = None, cells = None, n_chunk_size = 5000):
+
+def compute_running_stddev(files, means, gene_set=None, cells=None, n_chunk_size=5000):
     """Running per-gene standard deviation across files, given the population means."""
     d = len(means)
-    D = torch.zeros(d, device='cuda')
+    D = torch.zeros(d, device="cuda")
 
     if gene_set is None:
         fname = files[0]
@@ -117,12 +135,12 @@ def compute_running_stddev(files, means, gene_set = None, cells = None, n_chunk_
                 if len(cells_to_use) == 0:
                     continue
                 adata = adata[cells_to_use]
-            
+
             X = adata.X.toarray()
             X = torch.from_numpy(X).cuda().float()
             X /= torch.sum(X, axis=-1, keepdims=True)
             X = torch.nan_to_num(X, nan=0, posinf=0, neginf=0)
-    
+
             n, _ = X.shape
 
             for start in tqdm(range(0, n, n_chunk_size)):
@@ -145,7 +163,7 @@ def load_programs(path):
     Peripheral genes recorded alongside each program are ignored, so activities
     and summaries are computed over core genes only.
     """
-    with open(path, 'r') as f:
+    with open(path, "r") as f:
         data = json.load(f)
     programs = []
     for key in sorted(data.keys(), key=lambda x: int(x) if x.isdigit() else x):

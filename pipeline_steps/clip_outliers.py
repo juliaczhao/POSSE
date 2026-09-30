@@ -13,24 +13,27 @@ Writes
     <working_dir>/supp_material/clip_zscores.npy
 """
 
-import anndata
-import numpy as np
-import torch
 import logging
 import os
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import pipeline_steps.utils as utils
-import pandas as pd
 
+import anndata
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
+
+import pipeline_steps.utils as utils
+from pipeline_steps.file_order import list_cell_chunks
 
 _module_logger = logging.getLogger(__name__)
 
 
-def _log(*messages, logger=None, level='info'):
+def _log(*messages, logger=None, level="info"):
     """Emit a message through the given logger, or this module's logger."""
     text = " ".join(str(m) for m in messages)
     getattr(logger or _module_logger, level)(text)
+
 
 def count_num_cells(files):
     """Total number of cells across the given files."""
@@ -44,17 +47,52 @@ def count_num_cells(files):
 
 
 @torch.no_grad()
-def top_k_zscores(files, means, std_devs, top_k, gene_set=None, cells=None, n_chunk_size=100000):
-    """
-    means, std_devs: CUDA tensors (d,)
-    Returns lists length d with up to top_k z-scores and corresponding normalized values.
-    """
+def top_k_zscores(
+    files,
+    means,
+    std_devs,
+    top_k,
+    gene_set=None,
+    cells=None,
+    n_chunk_size=100000,
+    nonzero_counts=None,
+    logger=None,
+):
+    """Retain each gene's highest nonzero z-scores and normalized values."""
     device = means.device
     d = int(means.shape[0])
     safe_std = torch.where(std_devs == 0, torch.ones_like(std_devs), std_devs)
 
-    global_z = torch.full((top_k, d), float("-inf"), device=device)
-    global_x = torch.zeros((top_k, d), device=device)
+    if nonzero_counts is None:
+        capacities = np.full(d, top_k, dtype=np.int64)
+    else:
+        capacities = np.minimum(
+            np.asarray(nonzero_counts.detach().cpu(), dtype=np.int64),
+            top_k,
+        )
+
+    bucket_genes = {}
+    for gene_idx, capacity in enumerate(capacities):
+        bucket = min(top_k, 1 << (int(capacity) - 1).bit_length()) if capacity else 0
+        if bucket:
+            bucket_genes.setdefault(bucket, []).append(gene_idx)
+
+    retained_slots = int(sum(int(capacity) for capacity in capacities))
+    rectangular_slots = int(top_k) * d
+    _log(
+        "Capacity-aware top-k retention:",
+        f"{retained_slots} values across {d} genes",
+        f"({retained_slots / rectangular_slots:.1%} of rectangular storage)",
+        logger=logger,
+    )
+
+    states = {}
+    for bucket, genes in sorted(bucket_genes.items()):
+        states[bucket] = {
+            "genes": torch.as_tensor(genes, dtype=torch.long, device=device),
+            "z": torch.full((bucket, len(genes)), float("-inf"), device=device),
+            "x": torch.zeros((bucket, len(genes)), device=device),
+        }
 
     for fname in tqdm(files):
         adata = anndata.read_h5ad(fname)
@@ -75,34 +113,90 @@ def top_k_zscores(files, means, std_devs, top_k, gene_set=None, cells=None, n_ch
             rs = X.sum(dim=1, keepdim=True).clamp_min_(1e-12)
             X = X / rs
 
-            Z = (X - means) / safe_std
+            for bucket, state in states.items():
+                genes = state["genes"]
+                free_bytes, _ = torch.cuda.mem_get_info(device)
+                memory_budget = min(
+                    2 * 1024**3,
+                    max(16 * 1024**2, int(free_bytes * 0.15)),
+                )
+                bytes_per_gene = max(1, 8 * X.shape[0] + 48 * bucket)
+                genes_per_block = max(
+                    1,
+                    min(genes.numel(), memory_budget // bytes_per_gene),
+                )
+                k_here = min(bucket, X.shape[0])
 
-            k_here = min(top_k, Z.shape[0])
-            vals, idxs = torch.topk(Z, k=k_here, dim=0, largest=True, sorted=False)
-            orig = torch.gather(X, 0, idxs)
+                for gene_start in range(0, genes.numel(), genes_per_block):
+                    gene_stop = min(gene_start + genes_per_block, genes.numel())
+                    selected_genes = genes[gene_start:gene_stop]
+                    x_block = torch.index_select(X, 1, selected_genes)
+                    z_block = (
+                        x_block - torch.index_select(means, 0, selected_genes)
+                    ) / torch.index_select(safe_std, 0, selected_genes)
 
-            all_z = torch.cat([global_z, vals], dim=0)
-            all_x = torch.cat([global_x, orig], dim=0)
+                    vals, idxs = torch.topk(
+                        z_block,
+                        k=k_here,
+                        dim=0,
+                        largest=True,
+                        sorted=False,
+                    )
+                    orig = torch.gather(x_block, 0, idxs)
 
-            k_merge = min(top_k, all_z.shape[0])
-            merged_vals, merged_idx = torch.topk(all_z, k=k_merge, dim=0, largest=True, sorted=True)
-            global_z = merged_vals
-            global_x = torch.gather(all_x, 0, merged_idx)
+                    current_z = state["z"][:, gene_start:gene_stop]
+                    current_x = state["x"][:, gene_start:gene_stop]
+                    all_z = torch.cat([current_z, vals], dim=0)
+                    all_x = torch.cat([current_x, orig], dim=0)
+                    merged_vals, merged_idx = torch.topk(
+                        all_z,
+                        k=bucket,
+                        dim=0,
+                        largest=True,
+                        sorted=True,
+                    )
+                    state["z"][:, gene_start:gene_stop] = merged_vals
+                    state["x"][:, gene_start:gene_stop] = torch.gather(
+                        all_x, 0, merged_idx
+                    )
 
-            del X, Z, vals, idxs, orig, all_z, all_x, merged_vals, merged_idx
+                    del (
+                        selected_genes,
+                        x_block,
+                        z_block,
+                        vals,
+                        idxs,
+                        orig,
+                        current_z,
+                        current_x,
+                        all_z,
+                        all_x,
+                        merged_vals,
+                        merged_idx,
+                    )
+
+            del X
             torch.cuda.synchronize()
 
-    out_z, out_x = [], []
-    finite_mask = torch.isfinite(global_z)
-    gz, gx = global_z, global_x
-    for j in tqdm(range(d)):
-        m = finite_mask[:, j]
-        out_z.append(gz[m, j].detach().cpu().tolist())
-        out_x.append(gx[m, j].detach().cpu().tolist())
+    out_z = [[] for _ in range(d)]
+    out_x = [[] for _ in range(d)]
+    for state in states.values():
+        for bucket_gene_idx, gene_idx in enumerate(
+            state["genes"].detach().cpu().tolist()
+        ):
+            capacity = int(capacities[gene_idx])
+            out_z[gene_idx] = (
+                state["z"][:capacity, bucket_gene_idx].detach().cpu().tolist()
+            )
+            out_x[gene_idx] = (
+                state["x"][:capacity, bucket_gene_idx].detach().cpu().tolist()
+            )
     return out_z, out_x
 
 
-def compute_clipping_indices(topk_zscores_per_gene, topk_origvals_per_gene, COOCCUR_THRESHOLD):
+def compute_clipping_indices(
+    topk_zscores_per_gene, topk_origvals_per_gene, COOCCUR_THRESHOLD
+):
     """
     For each gene, compute the clipping index and corresponding UMI value using point_of_max_curvature.
     Only process genes with at least one nonzero value in topk_origvals_per_gene.
@@ -111,7 +205,11 @@ def compute_clipping_indices(topk_zscores_per_gene, topk_origvals_per_gene, COOC
     """
     clip_indices = []
     nonzero_gene_vals = []
-    for zscores, origvals in tqdm(zip(topk_zscores_per_gene, topk_origvals_per_gene), total=len(topk_zscores_per_gene), desc="Clipping indices"):
+    for zscores, origvals in tqdm(
+        zip(topk_zscores_per_gene, topk_origvals_per_gene),
+        total=len(topk_zscores_per_gene),
+        desc="Clipping indices",
+    ):
         origvals_arr = np.asarray(origvals)
         r = np.count_nonzero(origvals_arr)
         nonzero_gene_vals.append(r)
@@ -123,10 +221,18 @@ def compute_clipping_indices(topk_zscores_per_gene, topk_origvals_per_gene, COOC
             clip_indices.append((idx, umi, zscores[idx]))
         else:
             fallback_umi = float(np.max(origvals_arr)) if r > 0 else 0.0
-            clip_indices.append((None, fallback_umi, 0.))
+            clip_indices.append((None, fallback_umi, 0.0))
     return clip_indices, nonzero_gene_vals
 
-def _save_consolidated_diagnostics(nonzero_gene_vals, clip_indices, total_cells, clip_values, zscore_thresholds, output_png_path):
+
+def _save_consolidated_diagnostics(
+    nonzero_gene_vals,
+    clip_indices,
+    total_cells,
+    clip_values,
+    zscore_thresholds,
+    output_png_path,
+):
     fig, axes = plt.subplots(3, 1, figsize=(9, 12), constrained_layout=True)
 
     # Proportion of cells clipped per gene (approximate, based on top-k elbow)
@@ -142,29 +248,32 @@ def _save_consolidated_diagnostics(nonzero_gene_vals, clip_indices, total_cells,
         proportions = np.zeros(len(nonzero_gene_vals), dtype=float)
 
     axes[0].hist(proportions, bins=100, log=True)
-    axes[0].set_title('Proportion clipped per gene')
-    axes[0].set_xlabel('Proportion of cells (clipped)')
-    axes[0].set_ylabel('Count (log)')
+    axes[0].set_title("Proportion clipped per gene")
+    axes[0].set_xlabel("Proportion of cells (clipped)")
+    axes[0].set_ylabel("Count (log)")
 
     axes[1].hist(clip_values, bins=100, log=True)
-    axes[1].set_title('Clip values (UMI) for clipped genes')
-    axes[1].set_xlabel('Clip value (UMI)')
-    axes[1].set_ylabel('Count (log)')
+    axes[1].set_title("Clip values (UMI) for clipped genes")
+    axes[1].set_xlabel("Clip value (UMI)")
+    axes[1].set_ylabel("Count (log)")
 
     axes[2].hist(zscore_thresholds, bins=100)
-    axes[2].set_title('Z-score threshold at elbow (clipped genes)')
-    axes[2].set_xlabel('Elbow z-score')
-    axes[2].set_ylabel('Count')
+    axes[2].set_title("Z-score threshold at elbow (clipped genes)")
+    axes[2].set_xlabel("Elbow z-score")
+    axes[2].set_ylabel("Count")
 
-    fig.suptitle('Clipping diagnostics', fontsize=14)
+    fig.suptitle("Clipping diagnostics", fontsize=14)
     fig.savefig(output_png_path, dpi=200)
     plt.close(fig)
 
-def _compute_clip_core(files, top_k_proportion, COOCCUR_THRESHOLD, logger=None, return_intermediates=False):
+
+def _compute_clip_core(
+    files, top_k_proportion, COOCCUR_THRESHOLD, logger=None, return_intermediates=False
+):
     total_cells, gene_names = count_num_cells(files)
     _log("TOTAL NUMBER OF CELLS: ", total_cells, logger=logger)
 
-    top_k = int(top_k_proportion / 100. * total_cells)
+    top_k = int(top_k_proportion / 100.0 * total_cells)
     _log("TOP K CUTOFF: ", top_k, logger=logger)
 
     if top_k < COOCCUR_THRESHOLD:
@@ -176,22 +285,24 @@ def _compute_clip_core(files, top_k_proportion, COOCCUR_THRESHOLD, logger=None, 
             )
             clip_vals = np.ones(len(gene_names), dtype=float)
             results = {
-                'skipped': True,
-                'gene_names': gene_names,
-                'clip_vals': clip_vals,
-                'clip_z_scores': np.zeros(len(gene_names), dtype=float),
-                'nonzero_gene_vals': [0] * len(gene_names),
-                'clip_indices': [(None, 1.0, 0.0)] * len(gene_names),
-                'top_k': top_k,
-                'total_cells': total_cells,
+                "skipped": True,
+                "gene_names": gene_names,
+                "clip_vals": clip_vals,
+                "clip_z_scores": np.zeros(len(gene_names), dtype=float),
+                "nonzero_gene_vals": [0] * len(gene_names),
+                "clip_indices": [(None, 1.0, 0.0)] * len(gene_names),
+                "top_k": top_k,
+                "total_cells": total_cells,
             }
             if return_intermediates:
-                results.update({
-                    'orig_means': None,
-                    'orig_stddevs': None,
-                    'topk_zscores_per_gene': None,
-                    'topk_origvals_per_gene': None,
-                })
+                results.update(
+                    {
+                        "orig_means": None,
+                        "orig_stddevs": None,
+                        "topk_zscores_per_gene": None,
+                        "topk_origvals_per_gene": None,
+                    }
+                )
             return results
         _log(
             f"top_k below COOCCUR_THRESHOLD; flooring top_k to {COOCCUR_THRESHOLD}",
@@ -201,12 +312,27 @@ def _compute_clip_core(files, top_k_proportion, COOCCUR_THRESHOLD, logger=None, 
         top_k = COOCCUR_THRESHOLD
 
     _log("Computing Gene Means", logger=logger)
-    orig_means = utils.compute_running_mean(files, gene_set=None, cells=None)
+    orig_means, nonzero_counts = utils.compute_running_mean(
+        files,
+        gene_set=None,
+        cells=None,
+        return_nonzero_counts=True,
+    )
     _log("Computing Gene Stddevs", logger=logger)
-    orig_stddevs = utils.compute_running_stddev(files, orig_means, gene_set=None, cells=None)
+    orig_stddevs = utils.compute_running_stddev(
+        files, orig_means, gene_set=None, cells=None
+    )
 
     topk_zscores_per_gene, topk_origvals_per_gene = top_k_zscores(
-        files, orig_means, orig_stddevs, top_k, gene_set=None, cells=None, n_chunk_size=100000
+        files,
+        orig_means,
+        orig_stddevs,
+        top_k,
+        gene_set=None,
+        cells=None,
+        n_chunk_size=100000,
+        nonzero_counts=nonzero_counts,
+        logger=logger,
     )
 
     clip_indices, nonzero_gene_vals = compute_clipping_indices(
@@ -217,27 +343,32 @@ def _compute_clip_core(files, top_k_proportion, COOCCUR_THRESHOLD, logger=None, 
     clip_z_scores = np.array([z for idx, _, z in clip_indices])
 
     results = {
-        'skipped': False,
-        'gene_names': gene_names,
-        'clip_vals': clip_vals,
-        'clip_z_scores': clip_z_scores,
-        'nonzero_gene_vals': nonzero_gene_vals,
-        'clip_indices': clip_indices,
-        'top_k': top_k,
-        'total_cells': total_cells,
+        "skipped": False,
+        "gene_names": gene_names,
+        "clip_vals": clip_vals,
+        "clip_z_scores": clip_z_scores,
+        "nonzero_gene_vals": nonzero_gene_vals,
+        "clip_indices": clip_indices,
+        "top_k": top_k,
+        "total_cells": total_cells,
     }
 
     if return_intermediates:
-        results.update({
-            'orig_means': orig_means,
-            'orig_stddevs': orig_stddevs,
-            'topk_zscores_per_gene': topk_zscores_per_gene,
-            'topk_origvals_per_gene': topk_origvals_per_gene,
-        })
+        results.update(
+            {
+                "orig_means": orig_means,
+                "orig_stddevs": orig_stddevs,
+                "topk_zscores_per_gene": topk_zscores_per_gene,
+                "topk_origvals_per_gene": topk_origvals_per_gene,
+            }
+        )
 
     return results
 
-def clip_outliers_return(files, top_k_proportion, COOCCUR_THRESHOLD, logger=None, plots_output_dir=None):
+
+def clip_outliers_return(
+    files, top_k_proportion, COOCCUR_THRESHOLD, logger=None, plots_output_dir=None
+):
     """Compute per-gene clipping values for an explicit list of files.
 
     Variant of clip_outliers that takes the chunk files directly instead of
@@ -251,24 +382,35 @@ def clip_outliers_return(files, top_k_proportion, COOCCUR_THRESHOLD, logger=None
         return_intermediates=False,
     )
 
-    gene_names = results['gene_names']
-    clip_vals = results['clip_vals']
+    gene_names = results["gene_names"]
+    clip_vals = results["clip_vals"]
 
-    if results['skipped']:
+    if results["skipped"]:
         return pd.Series(dtype=float)
 
-    if plots_output_dir is not None and not results['skipped']:
+    if plots_output_dir is not None and not results["skipped"]:
         os.makedirs(plots_output_dir, exist_ok=True)
-        clip_values = [val for idx, val, z in results['clip_indices'] if idx is not None]
-        zscore_thresholds = [z for idx, _, z in results['clip_indices'] if idx is not None]
+        clip_values = [
+            val for idx, val, z in results["clip_indices"] if idx is not None
+        ]
+        zscore_thresholds = [
+            z for idx, _, z in results["clip_indices"] if idx is not None
+        ]
         _save_consolidated_diagnostics(
-            results['nonzero_gene_vals'], results['clip_indices'], results['total_cells'], clip_values, zscore_thresholds,
-            os.path.join(plots_output_dir, 'clipping_diagnostics.png')
+            results["nonzero_gene_vals"],
+            results["clip_indices"],
+            results["total_cells"],
+            clip_values,
+            zscore_thresholds,
+            os.path.join(plots_output_dir, "clipping_diagnostics.png"),
         )
-        np.save(os.path.join(plots_output_dir, 'clip_vals.npy'), clip_vals)
-        np.save(os.path.join(plots_output_dir, 'clip_zscores.npy'), results['clip_z_scores'])
+        np.save(os.path.join(plots_output_dir, "clip_vals.npy"), clip_vals)
+        np.save(
+            os.path.join(plots_output_dir, "clip_zscores.npy"), results["clip_z_scores"]
+        )
 
     return pd.Series(clip_vals, index=gene_names)
+
 
 def clip_outliers(dir_name, output_dir, top_k_proportion, COOCCUR_THRESHOLD):
     """Derive the ceiling applied to each gene's expression in later steps.
@@ -276,12 +418,8 @@ def clip_outliers(dir_name, output_dir, top_k_proportion, COOCCUR_THRESHOLD):
     A few very high cells would otherwise dominate a gene's dependence estimates,
     so the value at the top-k cell becomes that gene's clipping point.
     """
-    files = []
-    # TODO: sort these paths so the order is filesystem-independent.
-    for root, dirs, file in os.walk(dir_name):
-        for f in file:
-            if f.startswith("raw_adata_chunk_") and f.endswith(".h5ad"):
-                files.append(os.path.join(root, f))
+    files = list_cell_chunks(dir_name)
+    _module_logger.info("Cell chunks in numeric order: %s", files)
 
     results = _compute_clip_core(
         files,
@@ -291,36 +429,59 @@ def clip_outliers(dir_name, output_dir, top_k_proportion, COOCCUR_THRESHOLD):
         return_intermediates=True,
     )
 
-    if results['skipped']:
-        _module_logger.warning(f"Skipping clipping due to small top_k={results['top_k']} (< threshold {COOCCUR_THRESHOLD})")
+    if results["skipped"]:
+        _module_logger.warning(
+            f"Skipping clipping due to small top_k={results['top_k']} (< threshold {COOCCUR_THRESHOLD})"
+        )
         supp_material_dir = output_dir
         os.makedirs(supp_material_dir, exist_ok=True)
-        np.save(os.path.join(supp_material_dir, 'clip_vals.npy'), results['clip_vals'])
-        np.save(os.path.join(supp_material_dir, 'clip_zscores.npy'), results['clip_z_scores'])
+        np.save(os.path.join(supp_material_dir, "clip_vals.npy"), results["clip_vals"])
+        np.save(
+            os.path.join(supp_material_dir, "clip_zscores.npy"),
+            results["clip_z_scores"],
+        )
         return
 
     supp_material_dir = output_dir
     os.makedirs(supp_material_dir, exist_ok=True)
 
-    if results['orig_means'] is not None:
-        np.save(os.path.join(supp_material_dir, 'orig_means.npy'), results['orig_means'].cpu().numpy())
-    if results['orig_stddevs'] is not None:
-        np.save(os.path.join(supp_material_dir, 'orig_stddevs.npy'), results['orig_stddevs'].cpu().numpy())
+    if results["orig_means"] is not None:
+        np.save(
+            os.path.join(supp_material_dir, "orig_means.npy"),
+            results["orig_means"].cpu().numpy(),
+        )
+    if results["orig_stddevs"] is not None:
+        np.save(
+            os.path.join(supp_material_dir, "orig_stddevs.npy"),
+            results["orig_stddevs"].cpu().numpy(),
+        )
 
-    if results['topk_zscores_per_gene'] is not None:
-        np.save(os.path.join(supp_material_dir, 'topk_zscores_per_gene.npy'), np.array(results['topk_zscores_per_gene'], dtype=object))
-    if results['topk_origvals_per_gene'] is not None:
-        np.save(os.path.join(supp_material_dir, 'topk_origvals_per_gene.npy'), np.array(results['topk_origvals_per_gene'], dtype=object))
+    if results["topk_zscores_per_gene"] is not None:
+        np.save(
+            os.path.join(supp_material_dir, "topk_zscores_per_gene.npy"),
+            np.array(results["topk_zscores_per_gene"], dtype=object),
+        )
+    if results["topk_origvals_per_gene"] is not None:
+        np.save(
+            os.path.join(supp_material_dir, "topk_origvals_per_gene.npy"),
+            np.array(results["topk_origvals_per_gene"], dtype=object),
+        )
 
-    np.save(os.path.join(supp_material_dir, 'clip_vals.npy'), results['clip_vals'])
-    np.save(os.path.join(supp_material_dir, 'clip_zscores.npy'), results['clip_z_scores'])
+    np.save(os.path.join(supp_material_dir, "clip_vals.npy"), results["clip_vals"])
+    np.save(
+        os.path.join(supp_material_dir, "clip_zscores.npy"), results["clip_z_scores"]
+    )
 
-    plots_dir = os.path.join(supp_material_dir, 'plots')
+    plots_dir = os.path.join(supp_material_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    clip_values = [val for idx, val, z in results['clip_indices'] if idx is not None]
-    zscore_thresholds = [z for idx, _, z in results['clip_indices'] if idx is not None]
+    clip_values = [val for idx, val, z in results["clip_indices"] if idx is not None]
+    zscore_thresholds = [z for idx, _, z in results["clip_indices"] if idx is not None]
     _save_consolidated_diagnostics(
-        results['nonzero_gene_vals'], results['clip_indices'], results['total_cells'], clip_values, zscore_thresholds,
-        os.path.join(plots_dir, 'clipping_diagnostics.png')
+        results["nonzero_gene_vals"],
+        results["clip_indices"],
+        results["total_cells"],
+        clip_values,
+        zscore_thresholds,
+        os.path.join(plots_dir, "clipping_diagnostics.png"),
     )
