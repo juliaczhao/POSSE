@@ -16,9 +16,12 @@ and save them directly into `beta_fit_model/`:
 - `1M_20_HPO_xrfm_mu.pkl`
 - `1M_20_HPO_xrfm_log_kappa.pkl`
 
-The filenames and this directory are what `pipeline_config.json` expects under
-`statistical_program_finding` (`model_dir`, `model_mu_filename`, `model_logkappa_filename`); if you
-rename either file, update the config to match.
+Set `statistical_program_finding.model_dir` in `pipeline_config.json` to the directory containing
+these two canonically named files. The pipeline constructs each path by joining that directory
+with the filename shown above. Absolute paths are accepted. The checked-in `beta_fit_model/`
+default is resolved against the repository root and converted to an absolute path before Step 4.
+To store an explicit path, run `realpath beta_fit_model` from the repository root and copy the
+printed directory—not either individual model filename—into `model_dir`.
 
 ## What each file is
 

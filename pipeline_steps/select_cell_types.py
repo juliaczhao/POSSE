@@ -13,15 +13,18 @@ Writes
     <working_dir>/gene_names/gene_names.npy
 """
 
-import anndata
 import logging
 import os
 import shutil
+from collections import Counter
+
+import anndata
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from tqdm import tqdm
-from collections import Counter
+
+from pipeline_steps.file_order import sort_h5ad_paths
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +40,19 @@ def sanitize_obs_for_h5_write(obs):
         if isinstance(s.dtype, pd.CategoricalDtype):
             non_na = s.dropna()
             if len(non_na) == 0:
-                obs[col] = s.astype(str).fillna('').replace({'nan': '', 'NaN': '', '<NA>': ''}).values
+                obs[col] = (
+                    s.astype(str)
+                    .fillna("")
+                    .replace({"nan": "", "NaN": "", "<NA>": ""})
+                    .values
+                )
         elif s.dtype == object:
             if s.isna().any():
-                obs[col] = s.astype(str).replace({'nan': '', 'NaN': '', '<NA>': ''}).values
+                obs[col] = (
+                    s.astype(str).replace({"nan": "", "NaN": "", "<NA>": ""}).values
+                )
     return obs
+
 
 def safe_cast_to_uint16(X):
     """
@@ -51,19 +62,23 @@ def safe_cast_to_uint16(X):
     if sparse.issparse(X):
         max_val = X.max()
         if max_val > 65535:
-            raise ValueError(f"Data contains values > 65535 (uint16 limit): max value = {max_val}")
+            raise ValueError(
+                f"Data contains values > 65535 (uint16 limit): max value = {max_val}"
+            )
         return X.astype(np.uint16)
     else:
         # For dense arrays, use numpy's built-in overflow checking
         if X.max() > 65535:
-            raise ValueError(f"Data contains values > 65535 (uint16 limit): max value = {X.max()}")
+            raise ValueError(
+                f"Data contains values > 65535 (uint16 limit): max value = {X.max()}"
+            )
         return X.astype(np.uint16)
+
 
 CELL_CHUNK_SIZE = 100_000
 
 
-def select_cell_type(dir_name, subpop_dir, cell_types, cell_type_label='cell_type'):
-
+def select_cell_type(dir_name, subpop_dir, cell_types, cell_type_label="cell_type"):
     """Return the subset of adata matching the requested cell types.
 
     Programs are found within this subset, so the selection sets the biological
@@ -81,11 +96,10 @@ def select_cell_type(dir_name, subpop_dir, cell_types, cell_type_label='cell_typ
 
         raw_adata = anndata.read_h5ad(os.path.join(parent_dir, fname))
         if cell_type_label not in raw_adata.obs:
-            raw_adata.obs[cell_type_label] = 'unannotated'
-        # Mirror the chosen cell_type_label to obs['cell_type'] for downstream
-        # steps that read 'cell_type' directly (report_plots, llm_summaries, report).
-        if cell_type_label != 'cell_type':
-            raw_adata.obs['cell_type'] = raw_adata.obs[cell_type_label].values
+            raw_adata.obs[cell_type_label] = "unannotated"
+        # Keep a canonical cell_type column for downstream reporting.
+        if cell_type_label != "cell_type":
+            raw_adata.obs["cell_type"] = raw_adata.obs[cell_type_label].values
         if cell_types == []:
             filtered_adata = raw_adata
         else:
@@ -119,9 +133,11 @@ def select_cell_type(dir_name, subpop_dir, cell_types, cell_type_label='cell_typ
             end = min(start + CELL_CHUNK_SIZE, n_cells)
             chunk = filtered_adata[start:end]
             chunk_idx += 1
-            output_path = os.path.join(subpop_dir, f'raw_adata_chunk_{chunk_idx}.h5ad')
+            output_path = os.path.join(subpop_dir, f"raw_adata_chunk_{chunk_idx}.h5ad")
             chunk.write(output_path)
-            logger.info(f"  Saved chunk {chunk_idx}: {chunk.shape[0]} cells to {output_path}")
+            logger.info(
+                f"  Saved chunk {chunk_idx}: {chunk.shape[0]} cells to {output_path}"
+            )
 
     logger.info("Cell type counts (across all files):")
     for cell_type, count in all_cell_type_counts.items():
@@ -133,20 +149,31 @@ def select_cell_type(dir_name, subpop_dir, cell_types, cell_type_label='cell_typ
 def load_files(raw_adata_path):
     """Return list of (directory, filename) pairs for h5ad files at the given path."""
     if os.path.isdir(raw_adata_path):
-        h5ad_filenames = sorted(f for f in os.listdir(raw_adata_path) if f.endswith('.h5ad'))
-        logger.info("Found %d input file(s)", len(h5ad_filenames))
-        for fname in h5ad_filenames:
-            logger.info("  %s", fname)
-        return [(raw_adata_path, f) for f in h5ad_filenames]
-    elif os.path.isfile(raw_adata_path) and raw_adata_path.endswith('.h5ad'):
+        h5ad_paths = sort_h5ad_paths(
+            os.path.join(raw_adata_path, filename)
+            for filename in os.listdir(raw_adata_path)
+            if filename.endswith(".h5ad")
+        )
+        logger.info("Found %d input file(s)", len(h5ad_paths))
+        for path in h5ad_paths:
+            logger.info("  %s", path)
+        return [(os.path.dirname(path), os.path.basename(path)) for path in h5ad_paths]
+    elif os.path.isfile(raw_adata_path) and raw_adata_path.endswith(".h5ad"):
         logger.info("Using single input file: %s", raw_adata_path)
         return [(os.path.dirname(raw_adata_path), os.path.basename(raw_adata_path))]
     else:
-        raise ValueError(f"raw_adata_path is not a directory or h5ad file: {raw_adata_path}")
+        raise ValueError(
+            f"raw_adata_path is not a directory or h5ad file: {raw_adata_path}"
+        )
 
 
-def extract_cell_types(dir_name, selected_cell_types, output_dir=None,
-                       cell_type_label='cell_type', working_dir_name=None):
+def extract_cell_types(
+    dir_name,
+    selected_cell_types,
+    output_dir=None,
+    cell_type_label="cell_type",
+    working_dir_name=None,
+):
     """Write the selected cells as fixed-size chunks and return the working directory.
 
     Every later step streams over these chunks rather than loading the whole
@@ -154,24 +181,27 @@ def extract_cell_types(dir_name, selected_cell_types, output_dir=None,
     """
     if working_dir_name is None:
         if len(selected_cell_types) == 0:
-            working_dir_name = 'all'
+            working_dir_name = "all"
         elif len(selected_cell_types) == 1:
             working_dir_name = selected_cell_types[0]
         else:
             working_dir_name = "_".join(selected_cell_types)
 
     if selected_cell_types:
-        logger.info("Selecting cell types: %s", ", ".join(map(str, selected_cell_types)))
+        logger.info(
+            "Selecting cell types: %s", ", ".join(map(str, selected_cell_types))
+        )
     else:
         logger.info("Selecting all cell types")
 
-    working_dir = os.path.join(output_dir, working_dir_name) if output_dir is not None else working_dir_name
+    working_dir = (
+        os.path.join(output_dir, working_dir_name)
+        if output_dir is not None
+        else working_dir_name
+    )
     os.makedirs(working_dir, exist_ok=True)
 
-    # Clear only the subdirectories this step writes into, so stale chunks /
-    # gene_names from a prior run don't pollute output. Never rmtree the
-    # working_dir itself — it may contain user-owned files (raw inputs,
-    # configs, prior pipeline outputs from other steps).
+    # Replace only this step's outputs, leaving the rest of the run directory intact.
     anndata_files_dir = os.path.join(working_dir, "anndata_files")
     if os.path.exists(anndata_files_dir):
         shutil.rmtree(anndata_files_dir)
@@ -179,11 +209,12 @@ def extract_cell_types(dir_name, selected_cell_types, output_dir=None,
 
     subpop_dir = anndata_files_dir
 
-    gene_names_from_data = select_cell_type(dir_name, subpop_dir, selected_cell_types,
-                                             cell_type_label=cell_type_label)
-    gene_names_dir = os.path.join(working_dir, 'gene_names')
+    gene_names_from_data = select_cell_type(
+        dir_name, subpop_dir, selected_cell_types, cell_type_label=cell_type_label
+    )
+    gene_names_dir = os.path.join(working_dir, "gene_names")
     os.makedirs(gene_names_dir, exist_ok=True)
 
-    np.save(os.path.join(gene_names_dir, f'gene_names.npy'), gene_names_from_data)
+    np.save(os.path.join(gene_names_dir, "gene_names.npy"), gene_names_from_data)
 
     return working_dir
