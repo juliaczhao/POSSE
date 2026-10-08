@@ -16,9 +16,10 @@ and save them directly into `beta_fit_model/`:
 - `1M_20_HPO_xrfm_mu.pkl`
 - `1M_20_HPO_xrfm_log_kappa.pkl`
 
-The filenames and this directory are what `pipeline_config.json` expects under
-`statistical_program_finding` (`model_dir`, `model_mu_filename`, `model_logkappa_filename`); if you
-rename either file, update the config to match.
+The checked-in `statistical_program_finding.model_dir` setting is `beta_fit_model/`. Relative
+paths are resolved from the local POSSE repository, regardless of the directory from which the
+pipeline is launched. If the models are stored elsewhere, set `model_dir` to their absolute
+directory path.
 
 ## What each file is
 
